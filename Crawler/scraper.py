@@ -1,14 +1,16 @@
 import logging
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import os
-from crawl4ai import AsyncWebCrawler, LLMConfig, CrawlerRunConfig, LLMExtractionStrategy, BestFirstCrawlingStrategy, KeywordRelevanceScorer
+import queue
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, LLMConfig, LLMExtractionStrategy, BestFirstCrawlingStrategy, KeywordRelevanceScorer
 from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional, Dict, Any
-from .queue_manager import get_next_task, acquire_lock, release_lock
+from .queue_manager import acquire_lock, release_lock
 from app.core.config import BOINGO_API_URL, BOINGO_BEARER_TOKEN, OPENAI_API_KEY
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -52,7 +54,7 @@ class ListingData(BaseModel):
     address: Address
     property: Property
     listing: Listing
-    features: List[Feature] = Field(default_factory=list)  # Amenities will now go here
+    features: List[Feature] = Field(default_factory=list)
     files: List[str]
     contact: Contact
 
@@ -63,7 +65,7 @@ def merge_chunk_results(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
         "address": {"country": "", "region": "", "city": "", "district": ""},
         "property": {"lat": None, "lng": None},
         "listing": {"listing_title": "", "description": "", "price": "", "currency": "", "status": "", "listing_type": "", "category": ""},
-        "features": [],  # Will now include both features and former amenities
+        "features": [],
         "files": [],
         "contact": {"phone_number": "", "first_name": None, "last_name": None, "email_address": None, "company": None}
     }
@@ -76,14 +78,12 @@ def merge_chunk_results(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
                         if key in merged[section] and value and (merged[section][key] is None or merged[section][key] == ""):
                             merged[section][key] = value
                             logger.debug(f"Updated {section}.{key} with {value}")
-            # Merge features
             if "features" in chunk and isinstance(chunk["features"], list):
                 existing_features = {item["feature"]: item for item in merged["features"]}
                 for item in chunk["features"]:
                     if item["feature"] not in existing_features:
                         merged["features"].append(item)
                         logger.debug(f"Added to features: {item}")
-            # Merge amenities into features
             if "amenities" in chunk and isinstance(chunk["amenities"], list):
                 existing_features = {item["feature"]: item for item in merged["features"]}
                 for amenity in chunk["amenities"]:
@@ -91,7 +91,6 @@ def merge_chunk_results(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
                     if feature_item["feature"] not in existing_features:
                         merged["features"].append(feature_item)
                         logger.debug(f"Converted amenity to feature: {feature_item}")
-            # Merge files
             if "files" in chunk and isinstance(chunk["files"], list):
                 merged["files"].extend(chunk["files"])
                 merged["files"] = list(set(merged["files"]))
@@ -177,7 +176,7 @@ async def process_page(result, target_id: str) -> Optional[Dict[str, Any]]:
 
     try:
         validated_data = ListingData(**merged_data)
-        final_data = validated_data.dict(exclude_none=True)
+        final_data = validated_data.model_dump(exclude_none=True)
         logger.debug(f"Validated data: {json.dumps(final_data, default=str)}")
     except ValidationError as e:
         logger.error(f"Validation error for {result.url}: {str(e)}", exc_info=True)
@@ -199,7 +198,8 @@ async def process_page(result, target_id: str) -> Optional[Dict[str, Any]]:
         logger.debug(f"Invalid listing data for {result.url}: Missing required fields")
         return None
 
-    now = datetime.utcnow().isoformat() + "Z"
+    # Format timestamp in YYYY-MM-DDThh:mm:ssZ format
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     output = {
         "source_url": result.url,
         "data": final_data,
@@ -216,34 +216,44 @@ async def process_page(result, target_id: str) -> Optional[Dict[str, Any]]:
     logger.info(f"Processed valid listing at {result.url}: {final_data['listing']['listing_title']}")
     return output
 
-async def scrape_website(url: str, target_id: str):
-    """Scrape a website and return processed data."""
-    scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house", "price"])
-    llm_strategy = LLMExtractionStrategy(
-        llm_config=LLMConfig(provider="openai/gpt-4", api_token=OPENAI_API_KEY),
-        schema=ListingData.model_json_schema(),
-        extraction_type="schema",
-        instruction="""Extract detailed information from the provided markdown content about a single property listing. Return the data in JSON format matching the provided schema. Focus on extracting:
-        - Address details (country, region, city, district)
-        - Property coordinates (latitude and longitude, if available)
-        - Listing details (title, description, price, currency, status, type, category)
-        - Features (e.g., bedrooms, bathrooms, pool, garage - include all property attributes here, no separate amenities)
-        - File URLs (e.g., images, documents)
-        - Contact information (phone number, name, email, company)
-        If critical data (title, price, files) is missing, return an empty object."""
-    )
-    config = CrawlerRunConfig(
-        deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=1, max_pages=1, url_scorer=scorer),
-        extraction_strategy=llm_strategy
-    )
-    async with AsyncWebCrawler(verbose=True) as crawler:
-        results = await crawler.arun(url=url, config=config)
-        if not results or not isinstance(results, list) or len(results) == 0:
-            logger.error(f"No results returned for {url}")
-            return None
-        result = results[0]  # Take the first result
-        logger.debug(f"Crawled URL: {result.url}")
-    return await process_page(result, target_id)
+async def scrape_website(crawler: AsyncWebCrawler, url: str, target_id: str, retries: int = 2):
+    """Scrape a website using the provided crawler instance and return processed data with retry logic."""
+    for attempt in range(retries + 1):
+        try:
+            scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house", "price"])
+            llm_strategy = LLMExtractionStrategy(
+                llm_config=LLMConfig(provider="openai/gpt-4", api_token=OPENAI_API_KEY),
+                schema=ListingData.model_json_schema(),
+                extraction_type="schema",
+                instruction="""Extract detailed information from the provided markdown content about a single property listing. Return the data in JSON format matching the provided schema. Focus on extracting:
+                - Address details (country, region, city, district)
+                - Property coordinates (latitude and longitude, if available)
+                - Listing details (title, description, price, currency, status, type, category)
+                - Features (e.g., bedrooms, bathrooms, pool, garage - include all property attributes here, no separate amenities)
+                - File URLs (e.g., images, documents)
+                - Contact information (phone number, name, email, company)
+                If critical data (title, price, files) is missing, return an empty object."""
+            )
+            run_config = CrawlerRunConfig(
+                deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=1, max_pages=1, url_scorer=scorer),
+                extraction_strategy=llm_strategy,
+                cache_mode="BYPASS",
+                verbose=True,
+                page_timeout=60000
+            )
+            results = await crawler.arun(url=url, config=run_config)
+            if not results or not isinstance(results, list) or len(results) == 0:
+                logger.error(f"No results returned for {url}")
+                return None
+            result = results[0]
+            logger.debug(f"Crawled URL: {result.url}")
+            return await process_page(result, target_id)
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1}/{retries + 1} failed for {url}: {str(e)}")
+            if attempt == retries:
+                logger.error(f"All retries exhausted for {url}")
+                return None
+            await asyncio.sleep(5)
 
 def post_to_scraping_results(data):
     """Post scraped data to Boingo API."""
@@ -253,31 +263,84 @@ def post_to_scraping_results(data):
         scraping_result_id = response.json()["data"]["id"]
         logger.info(f"Posted to scraping-results: {scraping_result_id}")
         return scraping_result_id
-    logger.error(f"Failed to post: {response.text}")
+    logger.error(f"Failed to post: {response.status_code} - {response.text}")
     return None
 
-def process_scraping_task():
-    """Process the next scraping task from the queue."""
+def fetch_scraping_targets():
+    """Fetch URLs from the scraping-target endpoint and return a list of tasks."""
+    headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
+    try:
+        response = requests.get(f"{BOINGO_API_URL}/scraping-target", headers=headers, timeout=30)
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch scraping targets: {response.status_code} - {response.text}")
+            return []
+        data = response.json()
+        if data.get("status") != 200 or "data" not in data or "rows" not in data["data"]:
+            logger.error(f"Invalid response format: {json.dumps(data, indent=2)}")
+            return []
+        tasks = [
+            {"website_url": row["website_url"], "target_id": row["id"]}
+            for row in data["data"]["rows"]
+            if row.get("status") == "Active"
+        ]
+        logger.info(f"Fetched {len(tasks)} active scraping targets")
+        return tasks
+    except Exception as e:
+        logger.error(f"Error fetching scraping targets: {str(e)}", exc_info=True)
+        return []
+
+async def process_scraping_tasks():
+    """Fetch scraping targets, queue them, and process each task."""
     if not acquire_lock():
         logger.info("Another process is running, skipping...")
         return
+
     try:
-        task = get_next_task("scraping")
-        if task:
-            url = task["website_url"]
-            target_id = task["target_id"]
-            logger.info(f"Scraping {url}")
-            result = asyncio.run(scrape_website(url, target_id))
-            if result:
-                scraping_result_id = post_to_scraping_results(result)
-                if scraping_result_id:
-                    logger.info(f"Scraping completed for {url}, result ID: {scraping_result_id}")
-                else:
-                    logger.error(f"Failed to post scraping result for {url}")
+        tasks = fetch_scraping_targets()
+        if not tasks:
+            logger.info("No active scraping targets found")
+            return
+
+        task_queue = queue.Queue()
+        for task in tasks:
+            task_queue.put(task)
+            logger.debug(f"Queued task: {task['website_url']} (Target ID: {task['target_id']})")
+
+        browser_config = BrowserConfig(
+            browser_type="chromium",
+            headless=True,
+            verbose=True,
+            use_persistent_context=True,
+            user_data_dir="browser_data",
+            extra_args=["--no-sandbox", "--disable-setuid-sandbox"]
+        )
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            while not task_queue.empty():
+                task = task_queue.get()
+                url = task["website_url"]
+                target_id = task["target_id"]
+                logger.info(f"Scraping {url} (Target ID: {target_id})")
+                try:
+                    result = await scrape_website(crawler, url, target_id, retries=2)
+                    if result:
+                        scraping_result_id = post_to_scraping_results(result)
+                        if scraping_result_id:
+                            logger.info(f"Scraping completed for {url}, result ID: {scraping_result_id}")
+                        else:
+                            logger.error(f"Failed to post scraping result for {url}")
+                    else:
+                        logger.warning(f"No valid data scraped from {url}")
+                except Exception as e:
+                    logger.error(f"Scraping failed for {url}: {str(e)}", exc_info=True)
+                finally:
+                    task_queue.task_done()
+
+    except KeyboardInterrupt:
+        logger.info("Script interrupted by user")
     except Exception as e:
-        logger.error(f"Scraping failed: {str(e)}", exc_info=True)
+        logger.error(f"Error processing scraping tasks: {str(e)}", exc_info=True)
     finally:
         release_lock()
 
 if __name__ == "__main__":
-    process_scraping_task()
+    asyncio.run(process_scraping_tasks())
