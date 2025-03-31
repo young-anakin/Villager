@@ -7,9 +7,8 @@ import os
 from crawl4ai import AsyncWebCrawler, LLMConfig, CrawlerRunConfig, LLMExtractionStrategy, BestFirstCrawlingStrategy, KeywordRelevanceScorer
 from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional, Dict, Any
-from queue_manager import get_next_task, acquire_lock, release_lock
-from ..app.core.config import BOINGO_API_URL, BOINGO_BEARER_TOKEN, OPENAI_API_KEY  # Adjusted path
-
+from .queue_manager import get_next_task, acquire_lock, release_lock
+from app.core.config import BOINGO_API_URL, BOINGO_BEARER_TOKEN, OPENAI_API_KEY
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
