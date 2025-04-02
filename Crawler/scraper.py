@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Initialize OpenAI async client
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Pydantic Models (unchanged)
+# Pydantic Models
 class Address(BaseModel):
     country: str
     region: str
@@ -255,7 +255,7 @@ async def scrape_website(crawler: AsyncWebCrawler, url: str, target_id: str, lis
             scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house", "price"])
             instruction = """Extract detailed information from the provided markdown content about a single property listing. Return the data in JSON format matching the provided schema. Focus on extracting:
             - Address details (country, region, city, district)
-            - Property coordinates (latitude and longitude, if not you have to guess using the available location data.)
+            - Property coordinates (latitude and longitude, if not available, guess using location data)
             - Listing details (title, description, price, currency, status, type, category)
             - Features (e.g., bedrooms, bathrooms, pool, garage - include all property attributes here, no separate amenities)
             - File URLs (e.g., images, documents)
@@ -283,8 +283,9 @@ async def scrape_website(crawler: AsyncWebCrawler, url: str, target_id: str, lis
 
             for result in results:
                 logger.debug(f"Checking URL: {result.url}")
-                is_individual = result.url.startswith("https://www.properstar.com/listing/")
-                logger.debug(f"Is individual: {is_individual}")
+                # Use listing_format from the scraping target to identify individual listings
+                is_individual = result.url.startswith(listing_format)
+                logger.debug(f"Is individual (based on {listing_format}): {is_individual}")
 
                 # Queue internal links from all pages (hubs and listings)
                 internal_links = [link for link in (result.links or []) if urlparse(link).netloc == base_domain]
@@ -363,11 +364,10 @@ def fetch_scraping_targets():
         if data.get("status") != 200 or "data" not in data or "rows" not in data["data"]:
             logger.error(f"Invalid response format: {json.dumps(data, indent=2)}")
             return []
-        listing_format = r"https://www\.properstar\.com/listing/\d+"
         tasks = [
-            {"website_url": row["website_url"], "target_id": row["id"], "listing_format": listing_format}
+            {"website_url": row["website_url"], "target_id": row["id"], "listing_format": row.get("listing_url_format", "")}
             for row in data["data"]["rows"]
-            if row.get("status") == "Active"
+            if row.get("status") == "Active" and "listing_url_format" in row
         ]
         logger.info(f"Fetched {len(tasks)} active scraping targets")
         return tasks
