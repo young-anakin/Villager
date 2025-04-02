@@ -5,9 +5,12 @@ from datetime import datetime, timezone
 import asyncio
 import os
 import queue
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, LLMConfig, LLMExtractionStrategy, BestFirstCrawlingStrategy, KeywordRelevanceScorer
+import tiktoken
+from openai import AsyncOpenAI
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, BestFirstCrawlingStrategy, KeywordRelevanceScorer
 from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional, Dict, Any
+from urllib.parse import urlparse
 from .queue_manager import acquire_lock, release_lock
 from app.core.config import BOINGO_API_URL, BOINGO_BEARER_TOKEN, OPENAI_API_KEY
 
@@ -19,7 +22,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Pydantic Models
+# Initialize OpenAI async client
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# Pydantic Models (unchanged)
 class Address(BaseModel):
     country: str
     region: str
@@ -57,6 +63,39 @@ class ListingData(BaseModel):
     features: List[Feature] = Field(default_factory=list)
     files: List[str]
     contact: Contact
+
+def count_tokens(text: str, model: str = "gpt-4") -> int:
+    """Count the number of tokens in a text string using tiktoken."""
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+        return len(encoding.encode(text))
+    except Exception as e:
+        logger.error(f"Error counting tokens: {str(e)}")
+        return 0
+
+def split_into_chunks(content: str, max_tokens: int = 7000) -> List[str]:
+    """Split content into chunks based on token count, preserving logical sections."""
+    lines = content.split("\n")
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+
+    for line in lines:
+        line_tokens = count_tokens(line)
+        if current_tokens + line_tokens > max_tokens:
+            if current_chunk:
+                chunks.append("\n".join(current_chunk))
+            current_chunk = [line]
+            current_tokens = line_tokens
+        else:
+            current_chunk.append(line)
+            current_tokens += line_tokens
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+
+    logger.debug(f"Split content into {len(chunks)} chunks")
+    return chunks
 
 def merge_chunk_results(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Merge multiple chunk results into a single ListingData-compliant dictionary."""
@@ -101,49 +140,43 @@ def merge_chunk_results(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
         logger.error(f"Error merging chunks: {str(e)}", exc_info=True)
         raise
 
+async def extract_with_openai(content: str, schema: Dict[str, Any], instruction: str, max_retries: int = 3) -> str:
+    """Extract data from content using OpenAI API with retry logic for rate limits."""
+    for attempt in range(max_retries):
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": instruction},
+                    {"role": "user", "content": f"Content:\n{content}\n\nSchema:\n{json.dumps(schema, indent=2)}"}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            if "429" in str(e):
+                wait_time = 2 ** attempt * 10
+                logger.warning(f"Rate limit hit, retrying in {wait_time} seconds (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"OpenAI extraction failed: {str(e)}")
+                return "{}"
+    logger.error(f"Max retries ({max_retries}) exceeded for OpenAI extraction")
+    return "{}"
+
 async def process_page(result, target_id: str) -> Optional[Dict[str, Any]]:
-    """Process a crawled page, save markdown versions, and return validated listing data."""
+    """Process a crawled page and return validated listing data."""
     logger.debug(f"Processing page: {result.url}")
     if not result.success:
         logger.debug(f"Page crawl failed: {result.url}")
         return None
-
-    safe_url = "".join(c if c.isalnum() or c in "-_" else "_" for c in result.url)
-    markdown_dir = f"markdown_{target_id}"
-    os.makedirs(markdown_dir, exist_ok=True)
-    
-    markdown_types = {
-        "fit_markdown": result.markdown,
-        "markdown_with_citation": getattr(result, "markdown_with_citation", ""),
-        "raw_markdown": getattr(result, "raw_markdown", "")
-    }
-    
-    for markdown_type, content in markdown_types.items():
-        if content:
-            file_path = os.path.join(markdown_dir, f"{markdown_type}_{safe_url}.md")
-            try:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                logger.debug(f"Saved {markdown_type} to {file_path} (Length: {len(content)} characters)")
-            except Exception as e:
-                logger.error(f"Failed to save {markdown_type} to {file_path}: {str(e)}", exc_info=True)
-        else:
-            logger.debug(f"No content for {markdown_type} at {result.url}")
 
     lines = result.markdown.split("\n")
     top_level_title_count = sum(1 for line in lines if line.strip().startswith("# ") and not line.strip().startswith("##"))
     if top_level_title_count != 1:
         logger.debug(f"Skipping {result.url}: Incorrect title count ({top_level_title_count})")
         return None
-
-    metadata = result.metadata
-    if metadata:
-        multi_listing_keywords = ["listings", "properties", "results", "search", "for sale"]
-        if any(kw in metadata.get("og:title", "").lower() for kw in multi_listing_keywords) or \
-           any(kw in metadata.get("og:description", "").lower() for kw in multi_listing_keywords) or \
-           any(kw in metadata.get("title", "").lower() for kw in multi_listing_keywords):
-            logger.debug(f"Skipping {result.url}: Metadata suggests multiple listings")
-            return None
 
     if not result.extracted_content:
         logger.debug(f"No extracted content for {result.url}")
@@ -198,7 +231,6 @@ async def process_page(result, target_id: str) -> Optional[Dict[str, Any]]:
         logger.debug(f"Invalid listing data for {result.url}: Missing required fields")
         return None
 
-    # Format timestamp in YYYY-MM-DDThh:mm:ssZ format
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     output = {
         "source_url": result.url,
@@ -216,38 +248,91 @@ async def process_page(result, target_id: str) -> Optional[Dict[str, Any]]:
     logger.info(f"Processed valid listing at {result.url}: {final_data['listing']['listing_title']}")
     return output
 
-async def scrape_website(crawler: AsyncWebCrawler, url: str, target_id: str, retries: int = 2):
-    """Scrape a website using the provided crawler instance and return processed data with retry logic."""
+async def scrape_website(crawler: AsyncWebCrawler, url: str, target_id: str, listing_format: str, retries: int = 2, rate_limit_delay: float = 3.0, task_queue=None, processing_lock: asyncio.Lock = None) -> Optional[Dict]:
+    """Scrape a website, process individual listings sequentially, and queue internal links."""
     for attempt in range(retries + 1):
         try:
             scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house", "price"])
-            llm_strategy = LLMExtractionStrategy(
-                llm_config=LLMConfig(provider="openai/gpt-4", api_token=OPENAI_API_KEY),
-                schema=ListingData.model_json_schema(),
-                extraction_type="schema",
-                instruction="""Extract detailed information from the provided markdown content about a single property listing. Return the data in JSON format matching the provided schema. Focus on extracting:
-                - Address details (country, region, city, district)
-                - Property coordinates (latitude and longitude, if available)
-                - Listing details (title, description, price, currency, status, type, category)
-                - Features (e.g., bedrooms, bathrooms, pool, garage - include all property attributes here, no separate amenities)
-                - File URLs (e.g., images, documents)
-                - Contact information (phone number, name, email, company)
-                If critical data (title, price, files) is missing, return an empty object."""
-            )
+            instruction = """Extract detailed information from the provided markdown content about a single property listing. Return the data in JSON format matching the provided schema. Focus on extracting:
+            - Address details (country, region, city, district)
+            - Property coordinates (latitude and longitude, if not you have to guess using the available location data.)
+            - Listing details (title, description, price, currency, status, type, category)
+            - Features (e.g., bedrooms, bathrooms, pool, garage - include all property attributes here, no separate amenities)
+            - File URLs (e.g., images, documents)
+            - Contact information (phone number, name, email, company)
+            If critical data (title, price, files) is missing, return an empty object."""
+
             run_config = CrawlerRunConfig(
-                deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=1, max_pages=1, url_scorer=scorer),
-                extraction_strategy=llm_strategy,
+                deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=1, max_pages=30, url_scorer=scorer),
                 cache_mode="BYPASS",
                 verbose=True,
-                page_timeout=60000
+                page_timeout=60000,
+                exclude_external_links=True,
+                exclude_social_media_links=True,
             )
+            
             results = await crawler.arun(url=url, config=run_config)
+            logger.debug(f"Crawled {len(results)} pages: {[r.url for r in results]}")
             if not results or not isinstance(results, list) or len(results) == 0:
                 logger.error(f"No results returned for {url}")
                 return None
-            result = results[0]
-            logger.debug(f"Crawled URL: {result.url}")
-            return await process_page(result, target_id)
+
+            # Process each result
+            processed_any = False
+            base_domain = urlparse(url).netloc  # e.g., "www.properstar.com"
+
+            for result in results:
+                logger.debug(f"Checking URL: {result.url}")
+                is_individual = result.url.startswith("https://www.properstar.com/listing/")
+                logger.debug(f"Is individual: {is_individual}")
+
+                # Queue internal links from all pages (hubs and listings)
+                internal_links = [link for link in (result.links or []) if urlparse(link).netloc == base_domain]
+                if task_queue and internal_links:
+                    for link in internal_links[:10]:
+                        task_queue.put({"website_url": link, "target_id": target_id, "listing_format": listing_format})
+                        logger.debug(f"Queued internal link: {link}")
+
+                if not is_individual:
+                    logger.debug(f"Non-individual page (hub): {result.url}, queued {len(internal_links)} internal links")
+                    continue  # Skip to next result
+
+                # Process individual listing sequentially with lock
+                logger.debug(f"Individual listing detected: {result.url}")
+                if processing_lock:
+                    async with processing_lock:
+                        markdown_content = result.markdown or ""
+                        total_tokens = count_tokens(markdown_content)
+                        logger.debug(f"Total tokens in markdown: {total_tokens}")
+                        max_input_tokens = 7000
+
+                        if total_tokens > max_input_tokens:
+                            chunks = split_into_chunks(markdown_content, max_tokens=max_input_tokens)
+                            extracted_chunks = []
+                            for i, chunk in enumerate(chunks):
+                                logger.debug(f"Processing chunk {i+1}/{len(chunks)} with {count_tokens(chunk)} tokens")
+                                chunk_result = await extract_with_openai(chunk, ListingData.model_json_schema(), instruction)
+                                extracted_chunks.append(json.loads(chunk_result))
+                                if i < len(chunks) - 1:
+                                    await asyncio.sleep(rate_limit_delay)
+                            result.extracted_content = json.dumps(extracted_chunks)
+                        else:
+                            result.extracted_content = await extract_with_openai(markdown_content, ListingData.model_json_schema(), instruction)
+
+                        processed_data = await process_page(result, target_id)
+                        if processed_data:
+                            scraping_result_id = post_to_scraping_results(processed_data)
+                            if scraping_result_id:
+                                logger.info(f"Successfully posted {result.url} to scraping-results: {scraping_result_id}")
+                                processed_any = True
+                            else:
+                                logger.error(f"Failed to post scraping result for {result.url}")
+                        else:
+                            logger.debug(f"No valid data processed for {result.url}")
+
+            # Return None if no listings were processed, indicating this was a hub crawl
+            return processed_data if processed_any else None
+
         except Exception as e:
             logger.error(f"Attempt {attempt + 1}/{retries + 1} failed for {url}: {str(e)}")
             if attempt == retries:
@@ -278,8 +363,9 @@ def fetch_scraping_targets():
         if data.get("status") != 200 or "data" not in data or "rows" not in data["data"]:
             logger.error(f"Invalid response format: {json.dumps(data, indent=2)}")
             return []
+        listing_format = r"https://www\.properstar\.com/listing/\d+"
         tasks = [
-            {"website_url": row["website_url"], "target_id": row["id"]}
+            {"website_url": row["website_url"], "target_id": row["id"], "listing_format": listing_format}
             for row in data["data"]["rows"]
             if row.get("status") == "Active"
         ]
@@ -290,7 +376,7 @@ def fetch_scraping_targets():
         return []
 
 async def process_scraping_tasks():
-    """Fetch scraping targets, queue them, and process each task."""
+    """Fetch scraping targets, queue them, and process each task sequentially."""
     if not acquire_lock():
         logger.info("Another process is running, skipping...")
         return
@@ -314,26 +400,35 @@ async def process_scraping_tasks():
             user_data_dir="browser_data",
             extra_args=["--no-sandbox", "--disable-setuid-sandbox"]
         )
+        processing_lock = asyncio.Lock()
+
         async with AsyncWebCrawler(config=browser_config) as crawler:
             while not task_queue.empty():
                 task = task_queue.get()
                 url = task["website_url"]
                 target_id = task["target_id"]
+                listing_format = task["listing_format"]
                 logger.info(f"Scraping {url} (Target ID: {target_id})")
                 try:
-                    result = await scrape_website(crawler, url, target_id, retries=2)
+                    result = await scrape_website(
+                        crawler,
+                        url,
+                        target_id,
+                        listing_format,
+                        retries=2,
+                        rate_limit_delay=3.0,
+                        task_queue=task_queue,
+                        processing_lock=processing_lock
+                    )
                     if result:
-                        scraping_result_id = post_to_scraping_results(result)
-                        if scraping_result_id:
-                            logger.info(f"Scraping completed for {url}, result ID: {scraping_result_id}")
-                        else:
-                            logger.error(f"Failed to post scraping result for {url}")
+                        logger.info(f"Scraping completed for {url}, posted to scraping-results")
                     else:
-                        logger.warning(f"No valid data scraped from {url}")
+                        logger.debug(f"No data processed for {url} (likely a hub or invalid)")
                 except Exception as e:
                     logger.error(f"Scraping failed for {url}: {str(e)}", exc_info=True)
                 finally:
                     task_queue.task_done()
+                await asyncio.sleep(3.0)
 
     except KeyboardInterrupt:
         logger.info("Script interrupted by user")

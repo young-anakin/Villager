@@ -1,3 +1,4 @@
+# cleaner_agent.py
 import requests
 import json
 from datetime import datetime, timezone
@@ -136,14 +137,14 @@ def clean_with_openai(data):
         raise
 
 def process_cleaning():
-    """Process cleaning for queued tasks."""
+    """Process cleaning for all queued tasks."""
     if not acquire_lock():
         logger.info("Another process is running, skipping...")
         return
     
     headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
     try:
-        # Fetch queued tasks for Cleaning Agent
+        # Fetch all queued tasks for Cleaning Agent
         response = session.get(f"{BOINGO_API_URL}/agent-status/queued?agent_name=Cleaning Agent", headers=headers, timeout=30)
         response.raise_for_status()
         queued_tasks = response.json().get("data", {}).get("rows", {}).get("rows", [])
@@ -151,63 +152,67 @@ def process_cleaning():
             logger.info("No queued tasks for Cleaning Agent")
             return
 
-        # Process the first task
-        task = queued_tasks[0]
-        agent_id = task["id"]
-        scraping_result_id = task["scraping_result_id"]
+        logger.info(f"Found {len(queued_tasks)} queued tasks for Cleaning Agent")
 
-        # Fetch and log the original scraping result
-        result_response = session.get(f"{BOINGO_API_URL}/scraping-results/{scraping_result_id}", headers=headers, timeout=30)
-        result_response.raise_for_status()
-        result = result_response.json().get("data", {})
-        logger.info(f"Original data from scraping-results/{scraping_result_id}: {json.dumps(result, indent=2)}")
+        # Process each task one by one
+        for task in queued_tasks:
+            agent_id = task["id"]
+            scraping_result_id = task["scraping_result_id"]
+            logger.info(f"Processing task with agent_id: {agent_id}, scraping_result_id: {scraping_result_id}")
 
-        # Clean the data
-        cleaned_data = None
-        status = "Success"
-        try:
-            cleaned_data = clean_with_openai(result.get("data", {}).copy())
-        except Exception as e:
-            status = "Error"  # Use "Error" as per Boingo API's allowed values
-            logger.error(f"Cleaning failed for result ID {scraping_result_id}: {str(e)}")
+            # Fetch and log the original scraping result
+            result_response = session.get(f"{BOINGO_API_URL}/scraping-results/{scraping_result_id}", headers=headers, timeout=30)
+            result_response.raise_for_status()
+            result = result_response.json().get("data", {})
+            logger.info(f"Original data from scraping-results/{scraping_result_id}: {json.dumps(result, indent=2)}")
 
-        # Prepare update payload for scraping-results (without agent_statuses)
-        now = datetime.now(timezone.utc).isoformat()
-        update_payload = {
-            "id": scraping_result_id,
-            "source_url": result.get("source_url", ""),
-            "data": cleaned_data if cleaned_data is not None else result.get("data", {}),
-            "progress": 66 if status == "Success" else result.get("progress", 30),
-            "status": "In Progress",
-            "target_id": result.get("target_id", ""),
-            "last_updated": now,
-            "scraped_at": result.get("scraped_at", now)
-        }
+            # Clean the data
+            cleaned_data = None
+            status = "Success"
+            try:
+                cleaned_data = clean_with_openai(result.get("data", {}).copy())
+                logger.info(f"Successfully cleaned data for scraping_result_id: {scraping_result_id}")
+            except Exception as e:
+                status = "Error"  # Use "Error" as per Boingo API's allowed values
+                logger.error(f"Cleaning failed for result ID {scraping_result_id}: {str(e)}")
 
-        # Ensure 'files' field exists and limit to 2 entries if present
-        update_payload["data"].setdefault("files", [])
-        if update_payload["data"]["files"]:
-            update_payload["data"]["files"] = update_payload["data"]["files"][:2]
+            # Prepare update payload for scraping-results (without agent_statuses)
+            now = datetime.now(timezone.utc).isoformat()
+            update_payload = {
+                "id": scraping_result_id,
+                "source_url": result.get("source_url", ""),
+                "data": cleaned_data if cleaned_data is not None else result.get("data", {}),
+                "progress": 66 if status == "Success" else result.get("progress", 30),
+                "status": "In Progress",
+                "target_id": result.get("target_id", ""),
+                "last_updated": now,
+                "scraped_at": result.get("scraped_at", now)
+            }
 
-        # Update scraping-results
-        logger.info(f"Sending update to {BOINGO_API_URL}/scraping-results: {json.dumps(update_payload, indent=2)}")
-        response = session.put(f"{BOINGO_API_URL}/scraping-results", headers=headers, json=update_payload, timeout=30)
-        response.raise_for_status()
-        logger.info(f"Successfully updated scraping-results for ID {scraping_result_id}")
+            # Ensure 'files' field exists and limit to 2 entries if present
+            update_payload["data"].setdefault("files", [])
+            if update_payload["data"]["files"]:
+                update_payload["data"]["files"] = update_payload["data"]["files"][:2]
 
-        # Update agent-status (for the Cleaning Agent task only)
-        agent_update_payload = {
-            "id": agent_id,
-            "agent_name": "Cleaning Agent",
-            "status": status,
-            "start_time": task.get("start_time", now),
-            "end_time": now,
-            "scraping_result_id": scraping_result_id
-        }
-        logger.info(f"Sending update to {BOINGO_API_URL}/agent-status: {json.dumps(agent_update_payload, indent=2)}")
-        response = session.put(f"{BOINGO_API_URL}/agent-status", headers=headers, json=agent_update_payload, timeout=30)
-        response.raise_for_status()
-        logger.info(f"Successfully updated agent-status for ID {agent_id}")
+            # Update scraping-results
+            logger.info(f"Sending update to {BOINGO_API_URL}/scraping-results: {json.dumps(update_payload, indent=2)}")
+            response = session.put(f"{BOINGO_API_URL}/scraping-results", headers=headers, json=update_payload, timeout=30)
+            response.raise_for_status()
+            logger.info(f"Successfully updated scraping-results for ID {scraping_result_id}")
+
+            # Update agent-status (for the Cleaning Agent task only)
+            agent_update_payload = {
+                "id": agent_id,
+                "agent_name": "Cleaning Agent",
+                "status": status,
+                "start_time": task.get("start_time", now),
+                "end_time": now,
+                "scraping_result_id": scraping_result_id
+            }
+            logger.info(f"Sending update to {BOINGO_API_URL}/agent-status: {json.dumps(agent_update_payload, indent=2)}")
+            response = session.put(f"{BOINGO_API_URL}/agent-status", headers=headers, json=agent_update_payload, timeout=30)
+            response.raise_for_status()
+            logger.info(f"Successfully updated agent-status for ID {agent_id}")
 
     except requests.RequestException as e:
         logger.error(f"HTTP Request failed: {str(e)}")

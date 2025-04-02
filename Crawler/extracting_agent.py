@@ -1,3 +1,4 @@
+# extracting_agent.py
 import requests
 import json
 from datetime import datetime, timezone
@@ -135,93 +136,89 @@ def enhance_with_openai(data):
         raise
 
 def process_extracting():
-    """Process extracting for queued tasks."""
+    """Process extracting for all queued tasks."""
     if not acquire_lock():
         logger.info("Another process is running, skipping...")
         return
 
     headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
     try:
-        # Fetch queued tasks for Extracting Agent
+        # Fetch all queued tasks for Extracting Agent
         response = session.get(
             f"{BOINGO_API_URL}/agent-status/queued?agent_name=Extracting Agent",
             headers=headers,
             timeout=60  # Increased timeout
         )
-        if response.status_code != 200:
-            logger.error(f"Failed to fetch queued tasks: {response.status_code} - {response.text}")
-            return
+        response.raise_for_status()
         queued_tasks = response.json().get("data", {}).get("rows", {}).get("rows", [])
         if not queued_tasks:
             logger.info("No queued tasks for Extracting Agent")
             return
 
-        # Process the first task
-        task = queued_tasks[0]
-        agent_id = task["id"]
-        scraping_result_id = task["scraping_result_id"]
+        logger.info(f"Found {len(queued_tasks)} queued tasks for Extracting Agent")
 
-        # Fetch the scraping result
-        result_response = session.get(
-            f"{BOINGO_API_URL}/scraping-results/{scraping_result_id}",
-            headers=headers,
-            timeout=60  # Increased timeout
-        )
-        if result_response.status_code != 200:
-            logger.error(f"Failed to fetch scraping result {scraping_result_id}: {result_response.status_code} - {result_response.text}")
-            return
-        result = result_response.json().get("data", {})
-        logger.info(f"Original data from scraping-results/{scraping_result_id}: {json.dumps(result, indent=2)}")
+        # Process each task one by one
+        for task in queued_tasks:
+            agent_id = task["id"]
+            scraping_result_id = task["scraping_result_id"]
+            logger.info(f"Processing task with agent_id: {agent_id}, scraping_result_id: {scraping_result_id}")
 
-        # Skip if the data field is empty or contains no meaningful data
-        data = result.get("data", {})
-        if not data or (not any(data.get(key) for key in ["address", "listing", "contact"]) and not data.get("features")):
-            logger.warning(f"Skipping extraction for {scraping_result_id}: 'data' field is empty or contains no meaningful data")
-            # Update agent-status to mark as Error
-            now = datetime.now(timezone.utc).isoformat()
-            agent_update_payload = {
-                "id": agent_id,
-                "agent_name": "Extracting Agent",
-                "status": "Error",
-                "start_time": task.get("start_time", now),
-                "end_time": now,
-                "scraping_result_id": scraping_result_id
-            }
-            logger.info(f"Sending update to {BOINGO_API_URL}/agent-status: {json.dumps(agent_update_payload, indent=2)}")
-            response = session.put(f"{BOINGO_API_URL}/agent-status", headers=headers, json=agent_update_payload, timeout=60)
-            if response.status_code != 200:
-                logger.error(f"Failed to update agent status {agent_id}: {response.status_code} - {response.text}")
-            else:
+            # Fetch the scraping result
+            result_response = session.get(
+                f"{BOINGO_API_URL}/scraping-results/{scraping_result_id}",
+                headers=headers,
+                timeout=60  # Increased timeout
+            )
+            result_response.raise_for_status()
+            result = result_response.json().get("data", {})
+            logger.info(f"Original data from scraping-results/{scraping_result_id}: {json.dumps(result, indent=2)}")
+
+            # Skip if the data field is empty or contains no meaningful data
+            data = result.get("data", {})
+            if not data or (not any(data.get(key) for key in ["address", "listing", "contact"]) and not data.get("features")):
+                logger.warning(f"Skipping extraction for {scraping_result_id}: 'data' field is empty or contains no meaningful data")
+                now = datetime.now(timezone.utc).isoformat()
+                agent_update_payload = {
+                    "id": agent_id,
+                    "agent_name": "Extracting Agent",
+                    "status": "Error",
+                    "start_time": task.get("start_time", now),
+                    "end_time": now,
+                    "scraping_result_id": scraping_result_id
+                }
+                logger.info(f"Sending update to {BOINGO_API_URL}/agent-status: {json.dumps(agent_update_payload, indent=2)}")
+                response = session.put(f"{BOINGO_API_URL}/agent-status", headers=headers, json=agent_update_payload, timeout=60)
+                response.raise_for_status()
                 logger.info(f"Successfully updated agent-status for ID {agent_id} with status 'Error'")
-            return
+                continue  # Move to the next task
 
-        # Enhance the data
-        enhanced_data = None
-        status = "Success"
-        try:
-            enhanced_data = enhance_with_openai(data.copy())
-            if enhanced_data is None:  # No enhancement due to empty data
+            # Enhance the data
+            enhanced_data = None
+            status = "Success"
+            try:
+                enhanced_data = enhance_with_openai(data.copy())
+                if enhanced_data is None:  # No enhancement due to empty data
+                    status = "Error"
+                logger.info(f"Successfully enhanced data for scraping_result_id: {scraping_result_id}")
+            except Exception as e:
                 status = "Error"
-        except Exception as e:
-            status = "Error"
-            logger.error(f"Enhancement failed for result ID {scraping_result_id}: {str(e)}")
+                logger.error(f"Enhancement failed for result ID {scraping_result_id}: {str(e)}")
 
-        # Prepare update payload for scraping-results
-        now = datetime.now(timezone.utc).isoformat()
-        update_payload = {
-            "id": scraping_result_id,
-            "source_url": result.get("source_url", ""),
-            "data": enhanced_data if enhanced_data is not None else data,
-            "progress": 100 if status == "Success" else result.get("progress", 66),
-            "status": "Success" if status == "Success" else "Error",
-            "target_id": result.get("target_id", ""),
-            "last_updated": now,
-            "scraped_at": result.get("scraped_at", now)
-        }
+            # Prepare update payload for scraping-results
+            now = datetime.now(timezone.utc).isoformat()
+            update_payload = {
+                "id": scraping_result_id,
+                "source_url": result.get("source_url", ""),
+                "data": enhanced_data if enhanced_data is not None else data,
+                "progress": 100 if status == "Success" else result.get("progress", 66),
+                "status": "Success" if status == "Success" else "Error",
+                "target_id": result.get("target_id", ""),
+                "last_updated": now,
+                "scraped_at": result.get("scraped_at", now)
+            }
 
-        # Update scraping-results with retry logic
-        logger.info(f"Sending update to {BOINGO_API_URL}/scraping-results: {json.dumps(update_payload, indent=2)}")
-        try:
+            # Update scraping-results with retry logic
+            logger.info(f"Sending update to {BOINGO_API_URL}/scraping-results: {json.dumps(update_payload, indent=2)}")
             response = session.put(
                 f"{BOINGO_API_URL}/scraping-results",
                 headers=headers,
@@ -230,34 +227,32 @@ def process_extracting():
             )
             response.raise_for_status()
             logger.info(f"Successfully updated scraping-results for ID {scraping_result_id}")
-        except requests.Timeout:
-            logger.error(f"Timeout error while updating scraping result {scraping_result_id}")
-            status = "Error"
-        except requests.RequestException as e:
-            logger.error(f"Failed to update scraping result {scraping_result_id}: {str(e)}")
-            status = "Error"
 
-        # Update agent-status for Extracting Agent
-        agent_update_payload = {
-            "id": agent_id,
-            "agent_name": "Extracting Agent",
-            "status": status,
-            "start_time": task.get("start_time", now),
-            "end_time": now,
-            "scraping_result_id": scraping_result_id
-        }
-        logger.info(f"Sending update to {BOINGO_API_URL}/agent-status: {json.dumps(agent_update_payload, indent=2)}")
-        response = session.put(
-            f"{BOINGO_API_URL}/agent-status",
-            headers=headers,
-            json=agent_update_payload,
-            timeout=60
-        )
-        if response.status_code != 200:
-            logger.error(f"Failed to update agent status {agent_id}: {response.status_code} - {response.text}")
-        else:
+            # Update agent-status for Extracting Agent
+            agent_update_payload = {
+                "id": agent_id,
+                "agent_name": "Extracting Agent",
+                "status": status,
+                "start_time": task.get("start_time", now),
+                "end_time": now,
+                "scraping_result_id": scraping_result_id
+            }
+            logger.info(f"Sending update to {BOINGO_API_URL}/agent-status: {json.dumps(agent_update_payload, indent=2)}")
+            response = session.put(
+                f"{BOINGO_API_URL}/agent-status",
+                headers=headers,
+                json=agent_update_payload,
+                timeout=60
+            )
+            response.raise_for_status()
             logger.info(f"Successfully updated agent-status for ID {agent_id}")
 
+    except requests.RequestException as e:
+        logger.error(f"HTTP Request failed: {str(e)}")
+        if e.response is not None:
+            logger.error(f"Response body: {e.response.text}")
+        else:
+            logger.error("Response body: No response received")
     except Exception as e:
         logger.error(f"Extracting process failed: {str(e)}", exc_info=True)
     finally:
