@@ -79,6 +79,7 @@ def enhance_with_openai(data):
             "Rewrite each field to improve clarity and attractiveness while maintaining its meaning. "
             "For 'features', enhance the text within the JSON structure while preserving the format. "
             "If all fields are empty, return the input data unchanged in the same JSON format. "
+            "Make sure that there is latitude and longitude in property. If there isn't one, make a guess based on the address fields."
             "Return the results in JSON format with the same keys.\n\n"
             "Input data:\n"
         )
