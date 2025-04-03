@@ -263,7 +263,7 @@ async def scrape_website(crawler: AsyncWebCrawler, url: str, target_id: str, lis
             If critical data (title, price, files) is missing, return an empty object."""
 
             run_config = CrawlerRunConfig(
-                deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=1, max_pages=100, url_scorer=scorer),
+                deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=2, max_pages=40, url_scorer=scorer),
                 cache_mode="BYPASS",
                 verbose=True,
                 page_timeout=60000,
