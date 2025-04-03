@@ -305,7 +305,7 @@ async def scrape_website(crawler: AsyncWebCrawler, url: str, target_id: str, lis
                         markdown_content = result.markdown or ""
                         total_tokens = count_tokens(markdown_content)
                         logger.debug(f"Total tokens in markdown: {total_tokens}")
-                        max_input_tokens = 7000
+                        max_input_tokens = 4000
 
                         if total_tokens > max_input_tokens:
                             chunks = split_into_chunks(markdown_content, max_tokens=max_input_tokens)
