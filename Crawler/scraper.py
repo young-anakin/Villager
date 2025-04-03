@@ -255,7 +255,7 @@ async def scrape_website(crawler: AsyncWebCrawler, url: str, target_id: str, lis
             scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house", "price"])
             instruction = """Extract detailed information from the provided markdown content about a single property listing. Return the data in JSON format matching the provided schema. Focus on extracting:
             - Address details (country, region, city, district)
-            - Property coordinates (latitude and longitude, if not available, guess using location data)
+            - Property coordinates (latitude and longitude, if not available, guess using location data. I want you to always guess with whatever information that you have. The latitude and longitude must not be empty fields. They must be entered into property. )
             - Listing details (title, description, price, currency, status, type, category)
             - Features (e.g., bedrooms, bathrooms, pool, garage - include all property attributes here, no separate amenities)
             - File URLs (e.g., images, documents)
