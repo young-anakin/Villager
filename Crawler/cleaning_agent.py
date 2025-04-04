@@ -192,7 +192,7 @@ def process_cleaning():
             # Ensure 'files' field exists and limit to 2 entries if present
             update_payload["data"].setdefault("files", [])
             if update_payload["data"]["files"]:
-                update_payload["data"]["files"] = update_payload["data"]["files"][:2]
+                update_payload["data"]["files"] = update_payload["data"]["files"]
 
             # Update scraping-results
             logger.info(f"Sending update to {BOINGO_API_URL}/scraping-results: {json.dumps(update_payload, indent=2)}")
