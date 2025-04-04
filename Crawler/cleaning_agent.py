@@ -189,7 +189,6 @@ def process_cleaning():
                 "scraped_at": result.get("scraped_at", now)
             }
 
-            # Ensure 'files' field exists and limit to 2 entries if present
             update_payload["data"].setdefault("files", [])
             if update_payload["data"]["files"]:
                 update_payload["data"]["files"] = update_payload["data"]["files"]
