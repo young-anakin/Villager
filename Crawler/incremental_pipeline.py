@@ -34,7 +34,6 @@ class Address(BaseModel):
     country: str
     region: str
     city: str
-    district: Optional[str] = None
 
 class Property(BaseModel):
     lat: Optional[str] = None
@@ -57,7 +56,7 @@ class Contact(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     phone_number: Optional[str] = None
-    email_address: Optional[str] = None
+    email: Optional[str] = None
     company: Optional[str] = None
 
 class ListingData(BaseModel):
@@ -103,12 +102,12 @@ def split_into_chunks(content: str, max_tokens: int = 7000) -> List[str]:
 def merge_chunk_results(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     logger.debug(f"Merging {len(chunks)} chunks")
     merged = {
-        "address": {"country": "", "region": "", "city": "", "district": None},
+        "address": {"country": "", "region": "", "city": ""},
         "property": {"lat": None, "lng": None},
         "listing": {"listing_title": "", "description": "", "price": "", "currency": "", "status": "", "listing_type": "", "category": ""},
         "features": [],
         "files": [],
-        "contact": {"phone_number": None, "first_name": None, "last_name": None, "email_address": None, "company": None}
+        "contact": {"first_name": None, "last_name": None, "phone_number": None, "email": None, "company": None}
     }
     try:
         for chunk in chunks:
@@ -163,12 +162,12 @@ async def extract_with_openai(content: str, schema: Dict[str, Any], instruction:
 # Scraping Logic
 async def scrape_listing(content: str) -> Dict[str, Any]:
     instruction = """Extract detailed information from the provided markdown content about a single property listing. Return the data in JSON format matching the provided schema. Focus on extracting:
-    - Address details (country, region, city, district)
+    - Address details (country, region, city). Do not include 'district'.
     - Property coordinates (latitude and longitude, guess if not available based on location data)
     - Listing details (title, description, price, currency, status, type, category)
     - Features (e.g., bedrooms, bathrooms, include all property attributes)
     - File URLs (e.g., images, documents)
-    - Contact information (phone number, name, email, company)
+    - Contact information (phone number, first_name, last_name, email, company)
     If critical data (title, price, files) is missing, return an empty object."""
 
     total_tokens = count_tokens(content)
@@ -194,14 +193,11 @@ async def scrape_listing(content: str) -> Dict[str, Any]:
     try:
         validated_data = ListingData(**merged_data)
         final_data = validated_data.model_dump(exclude_none=True)
+        if "contact" in final_data and "email_address" in final_data["contact"]:
+            final_data["contact"]["email"] = final_data["contact"].pop("email_address")
     except ValidationError as e:
         logger.error(f"Validation error: {str(e)}")
-        if (merged_data.get("listing", {}).get("listing_title") and 
-            merged_data.get("listing", {}).get("price") and 
-            merged_data.get("files")):
-            final_data = merged_data
-        else:
-            return {}
+        return {}
 
     if "files" in final_data:
         final_data["files"] = list(set(''.join(url.split()) for url in final_data["files"]))
@@ -209,9 +205,9 @@ async def scrape_listing(content: str) -> Dict[str, Any]:
 
 # Cleaning Logic
 async def clean_listing(data: Dict[str, Any]) -> Dict[str, Any]:
-    instruction = """Translate the following text fields to English if needed, and refine them to be clear and concise. Return as JSON with the same structure."""
+    instruction = """Translate the following text fields to English, and refine them to be clear and concise. Do not include 'district' in 'address'. Return as JSON with the same structure."""
     text_fields = {
-        "address": data.get("address", {}),
+        "address": data.get("address", {"country": "", "region": "", "city": ""}),
         "listing": data.get("listing", {}),
         "contact": data.get("contact", {}),
         "features": data.get("features", [])
@@ -220,14 +216,16 @@ async def clean_listing(data: Dict[str, Any]) -> Dict[str, Any]:
     
     cleaned_text = await extract_with_openai(prompt, ListingData.model_json_schema(), instruction)
     cleaned_data = json.loads(cleaned_text)
+    if "contact" in cleaned_data and "email_address" in cleaned_data["contact"]:
+        cleaned_data["contact"]["email"] = cleaned_data["contact"].pop("email_address")
     data.update(cleaned_data)
     return data
 
 # Formatting Logic
 async def format_listing(data: Dict[str, Any]) -> Dict[str, Any]:
-    instruction = """Enhance these fields to be polished and appealing in English. Add lat/lng to 'property' if missing, guessing based on address. Return as JSON with the same structure plus 'property' with 'lat' and 'lng'."""
+    instruction = """Enhance these fields to be polished and appealing in English. Add lat/lng to 'property' if missing, guessing based on address. Do not include 'district' in 'address'. Return as JSON with the same structure plus 'property' with 'lat' and 'lng'."""
     text_fields = {
-        "address": data.get("address", {}),
+        "address": data.get("address", {"country": "", "region": "", "city": ""}),
         "listing": data.get("listing", {}),
         "contact": data.get("contact", {}),
         "features": data.get("features", [])
@@ -236,106 +234,245 @@ async def format_listing(data: Dict[str, Any]) -> Dict[str, Any]:
     
     formatted_text = await extract_with_openai(prompt, ListingData.model_json_schema(), instruction)
     formatted_data = json.loads(formatted_text)
+    if "contact" in formatted_data and "email_address" in formatted_data["contact"]:
+        formatted_data["contact"]["email"] = formatted_data["contact"].pop("email_address")
     data.update(formatted_data)
     if "property" not in data or not data["property"].get("lat"):
         data["property"] = formatted_data.get("property", {"lat": "0.0", "lng": "0.0"})
     return data
 
 # API Interaction Functions
-def post_to_scraping_results(data: Dict[str, Any]) -> Optional[str]:
+def fetch_scraping_targets() -> List[Dict[str, Any]]:
     headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
     try:
+        logger.debug(f"Fetching targets from {BOINGO_API_URL}/scraping-target/")
+        response = session.get(f"{BOINGO_API_URL}/scraping-target/", headers=headers, timeout=10)
+        response.raise_for_status()
+        response_data = response.json()
+        
+        if not isinstance(response_data, dict) or "data" not in response_data or "rows" not in response_data["data"]:
+            logger.error(f"Unexpected response format: {response_data}")
+            return []
+        
+        targets = response_data["data"]["rows"]
+        logger.info(f"Fetched {len(targets)} targets")
+        return targets
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch targets: {str(e)}")
+        return []
+
+def fetch_queued_listings() -> List[Dict[str, Any]]:
+    headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
+    try:
+        logger.debug(f"Fetching queued listings from {BOINGO_API_URL}/scraping-results/queued-agent-status")
+        response = session.get(f"{BOINGO_API_URL}/scraping-results/queued-agent-status", headers=headers, timeout=10)
+        response.raise_for_status()
+        response_data = response.json()
+        
+        if response_data.get("status") != 200 or "data" not in response_data or "rows" not in response_data["data"]:
+            logger.error(f"Unexpected response format: {response_data}")
+            return []
+        
+        queued_listings = response_data["data"]["rows"]
+        logger.info(f"Fetched {len(queued_listings)} queued listings")
+        return queued_listings
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch queued listings: {str(e)}")
+        return []
+
+def fetch_single_queued_listing(scraping_result_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single queued listing to get agent IDs after posting."""
+    headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
+    try:
+        response = session.get(f"{BOINGO_API_URL}/scraping-results/queued-agent-status", headers=headers, timeout=10)
+        response.raise_for_status()
+        response_data = response.json()
+        queued_listings = response_data["data"]["rows"]
+        for listing in queued_listings:
+            if listing["id"] == scraping_result_id:
+                logger.debug(f"Fetched queued listing for ID {scraping_result_id}: {json.dumps(listing, default=str)}")
+                return listing
+        logger.error(f"No queued listing found for ID {scraping_result_id}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch queued listing {scraping_result_id}: {str(e)}")
+        return None
+
+def debug_payload(payload: Dict[str, Any]) -> None:
+    logger.debug("Debugging payload structure and types:")
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            logger.debug(f"  {key} (dict):")
+            for sub_key, sub_value in value.items():
+                logger.debug(f"    {sub_key}: {sub_value} (type: {type(sub_value).__name__})")
+        elif isinstance(value, list):
+            logger.debug(f"  {key} (list of {len(value)} items):")
+            for i, item in enumerate(value):
+                logger.debug(f"    Item {i}: {item} (type: {type(item).__name__})")
+        else:
+            logger.debug(f"  {key}: {value} (type: {type(value).__name__})")
+
+def post_to_scraping_results(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
+    try:
+        debug_payload(data)
+        logger.debug(f"Posting to {BOINGO_API_URL}/scraping-results/: {json.dumps(data, default=str)}")
         response = session.post(f"{BOINGO_API_URL}/scraping-results/", headers=headers, json=data)
         response.raise_for_status()
-        return response.json()["data"]["id"]
-    except Exception as e:
+        response_data = response.json()
+        result_id = response_data["data"]["id"]
+        logger.debug(f"Successfully posted, got ID: {result_id}, Response: {json.dumps(response_data, default=str)}")
+        return {"id": result_id, "data": response_data["data"]}
+    except requests.exceptions.RequestException as e:
         logger.error(f"Failed to post to /scraping-results/: {str(e)}")
+        if hasattr(e, 'response') and e.response is not None:
+            logger.error(f"API response: {e.response.text}")
         return None
 
 def update_scraping_results(scraping_result_id: str, data: Dict[str, Any]) -> bool:
     headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
-    data["id"] = scraping_result_id
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "id": scraping_result_id,
+        "source_url": data.get("source_url", ""),
+        "data": {
+            "address": {
+                "country": data.get("data", {}).get("address", {}).get("country", ""),
+                "region": data.get("data", {}).get("address", {}).get("region", ""),
+                "city": data.get("data", {}).get("address", {}).get("city", "")
+            },
+            "property": {
+                "lat": data.get("data", {}).get("property", {}).get("lat", "0.0"),
+                "lng": data.get("data", {}).get("property", {}).get("lng", "0.0")
+            },
+            "listing": {
+                "listing_title": data.get("data", {}).get("listing", {}).get("listing_title", ""),
+                "description": data.get("data", {}).get("listing", {}).get("description", ""),
+                "price": data.get("data", {}).get("listing", {}).get("price", ""),
+                "currency": data.get("data", {}).get("listing", {}).get("currency", ""),
+                "status": data.get("data", {}).get("listing", {}).get("status", ""),
+                "listing_type": data.get("data", {}).get("listing", {}).get("listing_type", ""),
+                "category": data.get("data", {}).get("listing", {}).get("category", "")
+            },
+            "features": data.get("data", {}).get("features", []),
+            "files": data.get("data", {}).get("files", []),
+            "contact": {
+                "first_name": data.get("data", {}).get("contact", {}).get("first_name", ""),
+                "last_name": data.get("data", {}).get("contact", {}).get("last_name", ""),
+                "phone_number": data.get("data", {}).get("contact", {}).get("phone_number", ""),
+                "email": data.get("data", {}).get("contact", {}).get("email", ""),
+                "company": data.get("data", {}).get("contact", {}).get("company", "")
+            }
+        },
+        "progress": data.get("progress", 0),
+        "status": data.get("status", "In Progress"),
+        "target_id": data.get("target_id", ""),
+        "scraped_at": data.get("scraped_at", now),
+        "last_updated": now
+    }
     try:
-        response = session.put(f"{BOINGO_API_URL}/scraping-results", headers=headers, json=data)
+        logger.debug(f"Updating {BOINGO_API_URL}/scraping-results with: {json.dumps(payload, default=str)}")
+        response = session.put(f"{BOINGO_API_URL}/scraping-results", headers=headers, json=payload)
         response.raise_for_status()
+        logger.info(f"Successfully updated scraping-results for ID {scraping_result_id}")
         return True
     except Exception as e:
         logger.error(f"Failed to update /scraping-results/{scraping_result_id}: {str(e)}")
         return False
 
-# Process a Single Listing with Pauses
-async def process_listing(result, target_id: str) -> Optional[Dict[str, Any]]:
+def update_agent_status(agent: Dict[str, Any], scraping_result_id: str) -> bool:
+    headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "id": agent["id"],
+        "agent_name": agent["agent_name"],
+        "status": "Success",
+        "start_time": agent["start_time"],
+        "end_time": now,
+        "scraping_result_id": scraping_result_id
+    }
+    try:
+        logger.debug(f"Updating agent-status for {agent['agent_name']}: {json.dumps(payload, default=str)}")
+        response = session.put(f"{BOINGO_API_URL}/agent-status", headers=headers, json=payload)
+        response.raise_for_status()
+        logger.info(f"Successfully updated agent-status for {agent['agent_name']} (ID: {agent['id']})")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update agent-status for {agent['agent_name']}: {str(e)}")
+        return False
+
+# Process a Single Listing
+async def process_listing(result, target_id: str, scraping_result_id: str, initial_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not result.success or not result.markdown:
         logger.debug(f"Skipping {result.url}: No valid content")
         return None
 
+    base_payload = initial_payload.copy()
+    base_payload["source_url"] = result.url
+    base_payload["target_id"] = target_id
+
     # Step 1: Scrape (33%)
     try:
+        logger.debug(f"Scraping {result.url} for ID {scraping_result_id}")
         raw_data = await scrape_listing(result.markdown)
         if not raw_data:
             logger.debug(f"No valid data scraped for {result.url}")
             return None
 
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        base_payload = {
-            "source_url": result.url,
-            "data": raw_data,
-            "progress": 33,
-            "status": "In Progress",
-            "scraped_at": now,
-            "target_id": target_id,
-            "agent_status": [
-                {"agent_name": "Scraping Agent", "status": "Success", "start_time": now, "end_time": now},
-                {"agent_name": "Cleaning Agent", "status": "Queued", "start_time": now, "end_time": now},
-                {"agent_name": "Formatting Agent", "status": "Queued", "start_time": now, "end_time": now}
-            ]
-        }
-
-        scraping_result_id = post_to_scraping_results(base_payload)
-        if not scraping_result_id:
-            logger.error(f"Failed to post scraped data for {result.url}")
+        base_payload["data"] = raw_data
+        base_payload["progress"] = 33
+        if not update_scraping_results(scraping_result_id, base_payload):
+            logger.error(f"Failed to update scraped data for {result.url}")
             return None
-        logger.info(f"Scraped: Posted {result.url} to /scraping-results: {scraping_result_id}")
+        
+        scraping_agent = next(agent for agent in base_payload["agent_status"] if agent["agent_name"] == "Scraping Agent")
+        if not update_agent_status(scraping_agent, scraping_result_id):
+            logger.error(f"Failed to update Scraping Agent status for {result.url}")
+            return None
+        logger.info(f"Scraped: Updated {result.url} to progress 33")
     except Exception as e:
         logger.error(f"Error scraping listing {result.url}: {str(e)}")
         return None
 
-    # Pause before cleaning
     await asyncio.sleep(3.0)
 
     # Step 2: Clean (66%)
     try:
+        logger.debug(f"Cleaning data for {result.url} (ID: {scraping_result_id})")
         cleaned_data = await clean_listing(raw_data.copy())
         base_payload["data"] = cleaned_data
         base_payload["progress"] = 66
-        base_payload["agent_status"][1]["status"] = "Success"
-        base_payload["agent_status"][1]["end_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
         if not update_scraping_results(scraping_result_id, base_payload):
             logger.error(f"Failed to update cleaned data for {result.url}")
             return None
-        logger.info(f"Cleaned: Updated {result.url} in /scraping-results: {scraping_result_id}")
+        
+        cleaning_agent = next(agent for agent in base_payload["agent_status"] if agent["agent_name"] == "Cleaning Agent")
+        if not update_agent_status(cleaning_agent, scraping_result_id):
+            logger.error(f"Failed to update Cleaning Agent status for {result.url}")
+            return None
+        logger.info(f"Cleaned: Updated {result.url} to progress 66")
     except Exception as e:
         logger.error(f"Error cleaning listing {result.url}: {str(e)}")
         return None
 
-    # Pause before formatting
     await asyncio.sleep(3.0)
 
     # Step 3: Format (100%)
     try:
+        logger.debug(f"Formatting data for {result.url} (ID: {scraping_result_id})")
         formatted_data = await format_listing(cleaned_data.copy())
         base_payload["data"] = formatted_data
         base_payload["progress"] = 100
         base_payload["status"] = "Success"
-        base_payload["agent_status"][2]["status"] = "Success"
-        base_payload["agent_status"][2]["end_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
         if not update_scraping_results(scraping_result_id, base_payload):
             logger.error(f"Failed to update formatted data for {result.url}")
             return None
-        logger.info(f"Formatted: Updated {result.url} in /scraping-results: {scraping_result_id}")
-
+        
+        formatting_agent = next(agent for agent in base_payload["agent_status"] if agent["agent_name"] == "Extracting Agent")
+        if not update_agent_status(formatting_agent, scraping_result_id):
+            logger.error(f"Failed to update Extracting Agent status for {result.url}")
+            return None
+        logger.info(f"Formatted: Updated {result.url} to progress 100")
         return base_payload
     except Exception as e:
         logger.error(f"Error formatting listing {result.url}: {str(e)}")
@@ -345,23 +482,107 @@ async def process_listing(result, target_id: str) -> Optional[Dict[str, Any]]:
 async def scrape_and_process(url: str, target_id: str, listing_format: str):
     browser_config = BrowserConfig(browser_type="chromium", headless=True)
     async with AsyncWebCrawler(config=browser_config) as crawler:
-        scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house"])
-        run_config = CrawlerRunConfig(
-            deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=2, max_pages=20, url_scorer=scorer),
-            cache_mode="BYPASS"
-        )
-        
-        # Step 1: Crawl and collect matching URLs
-        results = await crawler.arun(url=url, config=run_config)
-        matching_listings = [result for result in results if result.url.startswith(listing_format)]
-        logger.info(f"Found {len(matching_listings)} listings matching {listing_format}")
+        try:
+            scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house"])
+            run_config = CrawlerRunConfig(
+                deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=3, max_pages=20, url_scorer=scorer),
+                cache_mode="BYPASS"
+            )
+            
+            logger.debug(f"Starting crawl at {url} with listing_format {listing_format}")
+            results = await crawler.arun(url=url, config=run_config)
+            logger.debug(f"Crawled {len(results)} pages: {[r.url for r in results]}")
+            
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            initial_payload_template = {
+                "data": {
+                    "address": {"country": "", "region": "", "city": ""},
+                    "property": {"lat": "0.0", "lng": "0.0"},
+                    "listing": {"listing_title": "", "description": "", "price": "", "currency": "", "status": "", "listing_type": "", "category": ""},
+                    "features": [],
+                    "files": [],
+                    "contact": {"first_name": "", "last_name": "", "phone_number": "", "email": "", "company": ""}
+                },
+                "progress": 0,
+                "status": "In Progress",
+                "scraped_at": now,
+                "target_id": target_id,
+                "agent_status": [
+                    {"agent_name": "Scraping Agent", "status": "Queued", "start_time": now, "end_time": now},
+                    {"agent_name": "Cleaning Agent", "status": "Queued", "start_time": now, "end_time": now},
+                    {"agent_name": "Extracting Agent", "status": "Queued", "start_time": now, "end_time": now}
+                ]
+            }
 
-        # Step 2: Process each listing one by one with full pauses
-        for result in matching_listings:
-            logger.debug(f"Processing {result.url}")
-            await process_listing(result, target_id)
-            # Pause between listings
-            await asyncio.sleep(3.0)
+            # Process listings as they are found
+            for result in results:
+                if result.url.startswith(listing_format) and result.success and result.markdown:
+                    logger.debug(f"Found valid listing: {result.url}, pausing crawl to process")
+                    
+                    # Prepare and post initial payload
+                    initial_payload = initial_payload_template.copy()
+                    initial_payload["source_url"] = result.url
+                    post_result = post_to_scraping_results(initial_payload)
+                    
+                    if post_result:
+                        scraping_result_id = post_result["id"]
+                        # Fetch the queued listing to get agent IDs
+                        queued_listing = fetch_single_queued_listing(scraping_result_id)
+                        if queued_listing and "agents" in queued_listing:
+                            initial_payload["agent_status"] = queued_listing["agents"]
+                            logger.debug(f"Updated agent_status with IDs: {json.dumps(initial_payload['agent_status'], default=str)}")
+                        else:
+                            logger.error(f"Failed to fetch agent IDs for {scraping_result_id}, using initial payload")
+                        
+                        logger.info(f"Queued listing {result.url} with ID {scraping_result_id}")
+                        await process_listing(result, target_id, scraping_result_id, initial_payload)
+                        logger.info(f"Completed processing {result.url}")
+                    else:
+                        logger.error(f"Failed to queue listing {result.url}, skipping processing")
+                    
+                    await asyncio.sleep(1.0)
+
+            logger.info(f"Completed crawling and processing all listings for {url}")
+
+            # Fetch and process any remaining queued listings
+            queued_listings = fetch_queued_listings()
+            if not queued_listings:
+                logger.warning("No additional queued listings found to process")
+            else:
+                for queued_listing in queued_listings:
+                    scraping_result_id = queued_listing["id"]
+                    result = next((r for r in results if r.url == queued_listing["source_url"]), None)
+                    if result:
+                        logger.debug(f"Processing queued listing {result.url} with ID {scraping_result_id}")
+                        queued_listing["agent_status"] = queued_listing["agents"]  # Use "agents" as "agent_status"
+                        await process_listing(result, target_id, scraping_result_id, queued_listing)
+                        await asyncio.sleep(3.0)
+        except Exception as e:
+            logger.error(f"Error during crawl of {url}: {str(e)}")
+        finally:
+            if crawler.crawler_strategy.browser_manager.browser:
+                await crawler.crawler_strategy.browser_manager.close()
+                logger.debug(f"Browser closed for {url}")
+
+# Main Function to Fetch and Process Targets
+async def main():
+    targets = fetch_scraping_targets()
+    if not targets:
+        logger.error("No targets fetched, exiting.")
+        return
+
+    for target in targets:
+        url = target.get("website_url")
+        target_id = target.get("id")
+        listing_format = target.get("listing_url_format")
+        if not url or not target_id or not listing_format:
+            logger.error(f"Invalid target: {json.dumps(target)}, skipping.")
+            continue
+
+        logger.info(f"Processing target: URL={url}, Target ID={target_id}, Listing Format={listing_format}")
+        await scrape_and_process(url, target_id, listing_format)
+        logger.info(f"Completed processing target {target_id}, pausing 5s")
+        await asyncio.sleep(5.0)
 
 if __name__ == "__main__":
-    asyncio.run(scrape_and_process("https://example.com", "abc123", "https://example.com/listing/"))
+    asyncio.run(main())
