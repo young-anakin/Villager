@@ -195,9 +195,9 @@ async def scrape_listing(content: str) -> Dict[str, Any]:
     - Property coordinates (latitude and longitude, guess if not available based on location data)
     - Listing details (title, description, price, currency, status, type, category)
     - Features (e.g., bedrooms, bathrooms, include all property attributes)
-    - File URLs (e.g., images, documents)
+    - ALL file URLs (e.g., images, documents) present in the content, without any limit
     - Contact information (phone number, first_name, last_name, email, company)
-    If critical data (title, price, files) is missing, return an empty object."""
+    If critical data (title, price, files) is missing, return an empty object."""   
 
     total_tokens = count_tokens(content)
     max_input_tokens = 7000
