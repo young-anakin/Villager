@@ -364,7 +364,7 @@ def update_scraping_results(scraping_result_id: str, data: Dict[str, Any]) -> bo
                 "company": data.get("data", {}).get("contact", {}).get("company", "")
             }
         },
-        "progress": data.get("process", 0),
+        "progress": data.get("progress", 0),  # Fixed: Use top-level progress directly
         "status": data.get("status", "In Progress"),
         "target_id": data.get("target_id", ""),
         "scraped_at": data.get("scraped_at", now),
