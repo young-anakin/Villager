@@ -2,6 +2,9 @@
 import logging
 import requests
 import json
+import os
+import sys
+import tempfile
 from datetime import datetime, timezone
 import asyncio
 import tiktoken
@@ -22,6 +25,30 @@ logging.basicConfig(
     handlers=[logging.FileHandler("incremental_pipeline.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+
+# Use a platform-independent temporary directory for the lock file
+LOCK_FILE = os.path.join(tempfile.gettempdir(), "incremental_pipeline.lock")
+
+# Lock management functions
+def acquire_lock():
+    if os.path.exists(LOCK_FILE):
+        logger.info(f"Another instance is running (lock file {LOCK_FILE} exists), exiting.")
+        sys.exit(0)
+    try:
+        with open(LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        logger.debug(f"Acquired lock, PID: {os.getpid()}, wrote to {LOCK_FILE}")
+    except IOError as e:
+        logger.error(f"Failed to acquire lock file {LOCK_FILE}: {str(e)}")
+        sys.exit(1)
+
+def release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            logger.debug(f"Released lock, removed {LOCK_FILE}")
+    except IOError as e:
+        logger.error(f"Failed to release lock file {LOCK_FILE}: {str(e)}")
 
 # Initialize OpenAI async client
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -518,7 +545,10 @@ async def scrape_and_process(url: str, target_id: str, listing_format: str, craw
     scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house"])
     run_config = CrawlerRunConfig(
         deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=search_range, max_pages=max_properties, url_scorer=scorer),
-        cache_mode="BYPASS"
+        cache_mode="BYPASS",
+        verbose=True,
+        page_timeout=30000,
+        wait_until="domcontentloaded"
     )
     
     logger.debug(f"Starting crawl at {url} with listing_format {listing_format}, search_range={search_range}, max_properties={max_properties}")
@@ -547,8 +577,8 @@ async def scrape_and_process(url: str, target_id: str, listing_format: str, craw
     }
 
     # Step 1: Post all valid listings with 0% progress
-    valid_listings = {}  # Store result objects by URL
-    posted_ids = {}      # Map URLs to scraping_result_ids
+    valid_listings = {}
+    posted_ids = {}
     for result in results:
         if result.url.startswith(listing_format) and result.success and result.markdown:
             logger.debug(f"Found valid listing: {result.url}")
@@ -563,12 +593,11 @@ async def scrape_and_process(url: str, target_id: str, listing_format: str, craw
                 logger.info(f"Queued listing {result.url} with ID {scraping_result_id} at 0% progress")
             else:
                 logger.error(f"Failed to queue listing {result.url}, skipping")
-            await asyncio.sleep(1.0)  # Small delay between postings
+            await asyncio.sleep(1.0)
 
     logger.info(f"Posted {len(posted_ids)} valid listings with 0% progress")
 
-    # Update list_extracted to True immediately after posting all valid listings
-    if posted_ids:  # Only update if at least one listing was posted
+    if posted_ids:
         if update_list_extracted(target_id):
             logger.info(f"Marked target {target_id} as list_extracted=True after posting all listings")
         else:
@@ -589,68 +618,73 @@ async def scrape_and_process(url: str, target_id: str, listing_format: str, craw
         if source_url in valid_listings and scraping_result_id == posted_ids[source_url]:
             logger.debug(f"Processing queued listing {source_url} with ID {scraping_result_id}")
             result = valid_listings[source_url]
-            queued_listing["agent_status"] = queued_listing["agents"]  # Update with fetched agent IDs
+            queued_listing["agent_status"] = queued_listing["agents"]
             result_data = await process_listing(result, target_id, scraping_result_id, queued_listing)
             if result_data:
                 processed_ids.add(scraping_result_id)
                 logger.info(f"Completed processing {source_url} (ID: {scraping_result_id})")
             else:
                 logger.error(f"Processing failed for {source_url}, continuing to next listing")
-            await asyncio.sleep(3.0)  # Delay between processing each listing
+            await asyncio.sleep(3.0)
 
     logger.info(f"Finished processing all listings for {url}, total processed: {len(processed_ids)}")
 
 # Main Function to Fetch and Process Targets
 async def main():
-    targets = fetch_scraping_targets()
-    if not targets:
-        logger.error("No targets fetched, exiting.")
-        return
+    # Acquire the lock at the start
+    acquire_lock()
+    try:
+        targets = fetch_scraping_targets()
+        if not targets:
+            logger.error("No targets fetched, exiting.")
+            return
 
-    # Filter targets where list_extracted is False
-    valid_targets = [t for t in targets if not t.get("list_extracted", True)]
-    if not valid_targets:
-        logger.info("No targets with list_extracted=False found to process.")
-        return
+        valid_targets = [t for t in targets if not t.get("list_extracted", True)]
+        if not valid_targets:
+            logger.info("No targets with list_extracted=False found to process.")
+            return
 
-    logger.info(f"Found {len(valid_targets)} targets with list_extracted=False to process")
+        logger.info(f"Found {len(valid_targets)} targets with list_extracted=False to process")
 
-    browser_config = BrowserConfig(
-        browser_type="chromium",
-        headless=True,
-        verbose=True,
-        use_persistent_context=True,
-        user_data_dir="browser_data",
-        extra_args=["--no-sandbox", "--disable-setuid-sandbox"]
-    )
-    
-    async with async_playwright() as p:
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            for target in valid_targets:
-                url = target.get("website_url")
-                target_id = target.get("id")
-                listing_format = target.get("listing_url_format")
-                search_range = target.get("search_range", 3)  # Default to 3 if not provided
-                max_properties = target.get("max_properties", 20)  # Default to 20 if not provided
-                list_extracted = target.get("list_extracted")
+        browser_config = BrowserConfig(
+            browser_type="chromium",
+            headless=True,
+            verbose=True,
+            use_persistent_context=True,
+            user_data_dir="browser_data",
+            extra_args=["--no-sandbox", "--disable-setuid-sandbox"]
+        )
+        
+        async with async_playwright() as p:
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                for target in valid_targets:
+                    url = target.get("website_url")
+                    target_id = target.get("id")
+                    listing_format = target.get("listing_url_format")
+                    search_range = target.get("search_range", 3)
+                    max_properties = target.get("max_properties", 20)
+                    list_extracted = target.get("list_extracted")
 
-                if not url or not target_id or not listing_format:
-                    logger.error(f"Invalid target: {json.dumps(target)}, skipping.")
-                    continue
+                    if not url or not target_id or not listing_format:
+                        logger.error(f"Invalid target: {json.dumps(target)}, skipping.")
+                        continue
 
-                if list_extracted:  # Double-check, should be caught by filter above
-                    logger.debug(f"Skipping target {target_id} as list_extracted is already True")
-                    continue
+                    if list_extracted:
+                        logger.debug(f"Skipping target {target_id} as list_extracted is already True")
+                        continue
 
-                logger.info(f"Processing target: URL={url}, Target ID={target_id}, Listing Format={listing_format}, Search Range={search_range}, Max Properties={max_properties}")
-                try:
-                    await scrape_and_process(url, target_id, listing_format, crawler, search_range, max_properties)
-                except Exception as e:
-                    logger.error(f"Failed to process target {target_id}: {str(e)}", exc_info=True)
-                    continue
+                    logger.info(f"Processing target: URL={url}, Target ID={target_id}, Listing Format={listing_format}, Search Range={search_range}, Max Properties={max_properties}")
+                    try:
+                        await scrape_and_process(url, target_id, listing_format, crawler, search_range, max_properties)
+                    except Exception as e:
+                        logger.error(f"Failed to process target {target_id}: {str(e)}", exc_info=True)
+                        continue
 
-                logger.info(f"Completed processing target {target_id}, pausing 5s")
-                await asyncio.sleep(5.0)
+                    logger.info(f"Completed processing target {target_id}, pausing 5s")
+                    await asyncio.sleep(5.0)
+    finally:
+        # Ensure the lock is released even if an error occurs
+        release_lock()
 
 if __name__ == "__main__":
     asyncio.run(main())
