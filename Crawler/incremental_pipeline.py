@@ -566,6 +566,13 @@ async def scrape_and_process(url: str, target_id: str, listing_format: str, craw
 
     logger.info(f"Posted {len(posted_ids)} valid listings with 0% progress")
 
+    # Update list_extracted to True immediately after posting all valid listings
+    if posted_ids:  # Only update if at least one listing was posted
+        if update_list_extracted(target_id):
+            logger.info(f"Marked target {target_id} as list_extracted=True after posting all listings")
+        else:
+            logger.error(f"Failed to update list_extracted for target {target_id}")
+
     # Step 2: Fetch all queued listings for this target
     queued_listings = fetch_queued_listings()
     if not queued_listings:
@@ -635,11 +642,6 @@ async def main():
                 logger.info(f"Processing target: URL={url}, Target ID={target_id}, Listing Format={listing_format}")
                 try:
                     await scrape_and_process(url, target_id, listing_format, crawler)
-                    # Update list_extracted to True after successful processing
-                    if update_list_extracted(target_id):
-                        logger.info(f"Marked target {target_id} as list_extracted=True")
-                    else:
-                        logger.error(f"Failed to update list_extracted for target {target_id}")
                 except Exception as e:
                     logger.error(f"Failed to process target {target_id}: {str(e)}", exc_info=True)
                     continue
