@@ -364,7 +364,7 @@ def update_scraping_results(scraping_result_id: str, data: Dict[str, Any]) -> bo
                 "company": data.get("data", {}).get("contact", {}).get("company", "")
             }
         },
-        "progress": data.get("progress", 0),  # Fixed: Use top-level progress directly
+        "progress": data.get("progress", 0),
         "status": data.get("status", "In Progress"),
         "target_id": data.get("target_id", ""),
         "scraped_at": data.get("scraped_at", now),
@@ -399,6 +399,28 @@ def update_agent_status(agent: Dict[str, Any], scraping_result_id: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Failed to update agent-status for {agent['agent_name']}: {str(e)}")
+        return False
+
+def update_list_extracted(target_id: str) -> bool:
+    headers = {"Authorization": f"Bearer {BOINGO_BEARER_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "id": target_id,
+        "list_extracted": True
+    }
+    try:
+        logger.debug(f"Updating list_extracted for target {target_id} to True")
+        response = session.put(
+            f"{BOINGO_API_URL}/scraping-target/update-list-extracted",
+            headers=headers,
+            json=payload
+        )
+        response.raise_for_status()
+        logger.info(f"Successfully updated list_extracted to True for target {target_id}")
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to update list_extracted for target {target_id}: {str(e)}")
+        if hasattr(e, 'response') and e.response is not None:
+            logger.error(f"API response: {e.response.text}")
         return False
 
 # Process a Single Listing
@@ -523,60 +545,50 @@ async def scrape_and_process(url: str, target_id: str, listing_format: str, craw
         ]
     }
 
-    processed_ids = set()
+    # Step 1: Post all valid listings with 0% progress
+    valid_listings = {}  # Store result objects by URL
+    posted_ids = {}      # Map URLs to scraping_result_ids
     for result in results:
         if result.url.startswith(listing_format) and result.success and result.markdown:
-            logger.debug(f"Found valid listing: {result.url}, pausing crawl to process")
+            logger.debug(f"Found valid listing: {result.url}")
             initial_payload = initial_payload_template.copy()
             initial_payload["source_url"] = result.url
             post_result = post_to_scraping_results(initial_payload)
             
             if post_result:
                 scraping_result_id = post_result["id"]
-                if scraping_result_id in processed_ids:
-                    logger.debug(f"Skipping already processed ID {scraping_result_id}")
-                    continue
-                
-                queued_listing = fetch_single_queued_listing(scraping_result_id)
-                if queued_listing and "agents" in queued_listing:
-                    initial_payload["agent_status"] = queued_listing["agents"]
-                    logger.debug(f"Updated agent_status with IDs: {json.dumps(initial_payload['agent_status'], default=str)}")
-                else:
-                    logger.error(f"Failed to fetch agent IDs for {scraping_result_id}, using initial payload")
-                
-                logger.info(f"Queued listing {result.url} with ID {scraping_result_id}")
-                result_data = await process_listing(result, target_id, scraping_result_id, initial_payload)
-                if result_data:
-                    processed_ids.add(scraping_result_id)
-                    logger.info(f"Completed processing {result.url} (ID: {scraping_result_id})")
-                else:
-                    logger.error(f"Processing failed for {result.url}, continuing to next listing")
+                valid_listings[result.url] = result
+                posted_ids[result.url] = scraping_result_id
+                logger.info(f"Queued listing {result.url} with ID {scraping_result_id} at 0% progress")
             else:
-                logger.error(f"Failed to queue listing {result.url}, skipping processing")
-            
-            await asyncio.sleep(1.0)
+                logger.error(f"Failed to queue listing {result.url}, skipping")
+            await asyncio.sleep(1.0)  # Small delay between postings
 
-    logger.info(f"Completed crawling {url}, processed {len(processed_ids)} listings")
+    logger.info(f"Posted {len(posted_ids)} valid listings with 0% progress")
 
+    # Step 2: Fetch all queued listings for this target
     queued_listings = fetch_queued_listings()
     if not queued_listings:
-        logger.warning("No additional queued listings found to process")
-    else:
-        for queued_listing in queued_listings:
-            scraping_result_id = queued_listing["id"]
-            if scraping_result_id in processed_ids:
-                logger.debug(f"Skipping already processed queued listing ID {scraping_result_id}")
-                continue
-            
-            result = next((r for r in results if r.url == queued_listing["source_url"]), None)
-            if result:
-                logger.debug(f"Processing queued listing {result.url} with ID {scraping_result_id}")
-                queued_listing["agent_status"] = queued_listing["agents"]
-                result_data = await process_listing(result, target_id, scraping_result_id, queued_listing)
-                if result_data:
-                    processed_ids.add(scraping_result_id)
-                    logger.info(f"Completed processing queued listing {result.url} (ID: {scraping_result_id})")
-                await asyncio.sleep(3.0)
+        logger.warning("No queued listings found to process")
+        return
+
+    # Step 3: Process only the listings we just posted
+    processed_ids = set()
+    for queued_listing in queued_listings:
+        scraping_result_id = queued_listing["id"]
+        source_url = queued_listing["source_url"]
+        
+        if source_url in valid_listings and scraping_result_id == posted_ids[source_url]:
+            logger.debug(f"Processing queued listing {source_url} with ID {scraping_result_id}")
+            result = valid_listings[source_url]
+            queued_listing["agent_status"] = queued_listing["agents"]  # Update with fetched agent IDs
+            result_data = await process_listing(result, target_id, scraping_result_id, queued_listing)
+            if result_data:
+                processed_ids.add(scraping_result_id)
+                logger.info(f"Completed processing {source_url} (ID: {scraping_result_id})")
+            else:
+                logger.error(f"Processing failed for {source_url}, continuing to next listing")
+            await asyncio.sleep(3.0)  # Delay between processing each listing
 
     logger.info(f"Finished processing all listings for {url}, total processed: {len(processed_ids)}")
 
@@ -586,6 +598,14 @@ async def main():
     if not targets:
         logger.error("No targets fetched, exiting.")
         return
+
+    # Filter targets where list_extracted is False
+    valid_targets = [t for t in targets if not t.get("list_extracted", True)]
+    if not valid_targets:
+        logger.info("No targets with list_extracted=False found to process.")
+        return
+
+    logger.info(f"Found {len(valid_targets)} targets with list_extracted=False to process")
 
     browser_config = BrowserConfig(
         browser_type="chromium",
@@ -598,18 +618,28 @@ async def main():
     
     async with async_playwright() as p:
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            for target in targets:
+            for target in valid_targets:
                 url = target.get("website_url")
                 target_id = target.get("id")
                 listing_format = target.get("listing_url_format")
+                list_extracted = target.get("list_extracted")
 
                 if not url or not target_id or not listing_format:
                     logger.error(f"Invalid target: {json.dumps(target)}, skipping.")
                     continue
 
+                if list_extracted:  # Double-check, should be caught by filter above
+                    logger.debug(f"Skipping target {target_id} as list_extracted is already True")
+                    continue
+
                 logger.info(f"Processing target: URL={url}, Target ID={target_id}, Listing Format={listing_format}")
                 try:
                     await scrape_and_process(url, target_id, listing_format, crawler)
+                    # Update list_extracted to True after successful processing
+                    if update_list_extracted(target_id):
+                        logger.info(f"Marked target {target_id} as list_extracted=True")
+                    else:
+                        logger.error(f"Failed to update list_extracted for target {target_id}")
                 except Exception as e:
                     logger.error(f"Failed to process target {target_id}: {str(e)}", exc_info=True)
                     continue
