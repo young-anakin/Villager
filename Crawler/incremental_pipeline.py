@@ -514,14 +514,14 @@ async def process_listing(result, target_id: str, scraping_result_id: str, initi
         return None
 
 # Main Scrape and Process Function
-async def scrape_and_process(url: str, target_id: str, listing_format: str, crawler: AsyncWebCrawler):
+async def scrape_and_process(url: str, target_id: str, listing_format: str, crawler: AsyncWebCrawler, search_range: int, max_properties: int):
     scorer = KeywordRelevanceScorer(keywords=["property", "sale", "house"])
     run_config = CrawlerRunConfig(
-        deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=3, max_pages=20, url_scorer=scorer),
+        deep_crawl_strategy=BestFirstCrawlingStrategy(max_depth=search_range, max_pages=max_properties, url_scorer=scorer),
         cache_mode="BYPASS"
     )
     
-    logger.debug(f"Starting crawl at {url} with listing_format {listing_format}")
+    logger.debug(f"Starting crawl at {url} with listing_format {listing_format}, search_range={search_range}, max_properties={max_properties}")
     results = await crawler.arun(url=url, config=run_config)
     logger.debug(f"Crawled {len(results)} pages: {[r.url for r in results]}")
     
@@ -630,6 +630,8 @@ async def main():
                 url = target.get("website_url")
                 target_id = target.get("id")
                 listing_format = target.get("listing_url_format")
+                search_range = target.get("search_range", 3)  # Default to 3 if not provided
+                max_properties = target.get("max_properties", 20)  # Default to 20 if not provided
                 list_extracted = target.get("list_extracted")
 
                 if not url or not target_id or not listing_format:
@@ -640,9 +642,9 @@ async def main():
                     logger.debug(f"Skipping target {target_id} as list_extracted is already True")
                     continue
 
-                logger.info(f"Processing target: URL={url}, Target ID={target_id}, Listing Format={listing_format}")
+                logger.info(f"Processing target: URL={url}, Target ID={target_id}, Listing Format={listing_format}, Search Range={search_range}, Max Properties={max_properties}")
                 try:
-                    await scrape_and_process(url, target_id, listing_format, crawler)
+                    await scrape_and_process(url, target_id, listing_format, crawler, search_range, max_properties)
                 except Exception as e:
                     logger.error(f"Failed to process target {target_id}: {str(e)}", exc_info=True)
                     continue
