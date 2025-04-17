@@ -1,0 +1,14 @@
+{
+  "scraping": [
+    {
+      "website_url": "https://www.casasyterrenos.com/propiedad/casa-venta-rio-papaloapan-fovissste-100-puerto-vallarta-jal-3747058",
+      "target_id": "736f8830-6e08-4d66-8395-329213394101"
+    },
+    {
+      "website_url": "https://www.casasyterrenos.com/propiedad/casa-venta-arbol-del-coral-nuevo-ixtapa-puerto-vallarta-jal-3742453",
+      "target_id": "8d993f61-b973-45c1-a63a-5234da41e277"
+    }
+  ],
+  "cleaning": [],
+  "extracting": []
+}

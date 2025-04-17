@@ -1,0 +1,111 @@
+{
+  "target_id": "fb94b628-3c5a-4651-b08d-484c71cdc5ef",
+  "progress": 100.0,
+  "status": "Completed",
+  "data": {
+    "target_id": "fb94b628-3c5a-4651-b08d-484c71cdc5ef",
+    "data": {
+      "address": {
+        "country": "Mexico",
+        "region": "Quintana Roo",
+        "city": "Tulum"
+      },
+      "property": {
+        "lat": "20.2115",
+        "lng": "-87.4654"
+      },
+      "listing": {
+        "listing_title": "2 Bedroom Apartment New in Tulum - Great Price!",
+        "description": "Cleaned: Luna de Plata is located in the jungle of Region 15, between the area with the highest tourist influx in Tulum Pueblo (La Veleta) and the famous Hotel Zone. It's the perfect balance between the tranquility and natural beauty of the jungle while still having easy access to the fully developed and busy areas of Tulum. Conveniently located between Avenida Kukulk\u00e1n (which goes directly to the beach) and Fifth Avenue it promises to be a major shopping destination and tourist corridor. Because of the central location of Luna de Plata; the areas of greatest interest in Tulum are just a few minutes drive away or a bike ride away! It is a condominium of 4 exclusive apartments with common areas where you will find a pool with a waterfall of 33 m2, designated parking lots, bicycle parking and a coexistence area with barbecue. Ground floor apartment #1 consists of 95 m2 (1005 ft2) with 2 bedrooms, 2 full bathrooms, laundry room, kitchen, living and dining room in open plan and a covered balcony overlooking the common areas. The building is already in its last stage and ready to be delivered and deeded 60 days from the date of signing the contract. Prices subject to change without warning.",
+        "price": "179200",
+        "currency": "USD",
+        "status": "new",
+        "listing_type": "buy",
+        "category": "Condo/Apartment"
+      },
+      "features": [
+        {
+          "feature": "rooms",
+          "value": "5"
+        },
+        {
+          "feature": "bedrooms",
+          "value": "2"
+        },
+        {
+          "feature": "bathrooms",
+          "value": "2"
+        },
+        {
+          "feature": "living_area",
+          "value": "915 sq ft (85 m\u00b2)"
+        },
+        {
+          "feature": "land_area",
+          "value": "3767 sq ft (350 m\u00b2)"
+        },
+        {
+          "feature": "internal_area",
+          "value": "915 sq ft (85 m\u00b2)"
+        },
+        {
+          "feature": "total_area",
+          "value": "1023 sq ft (95 m\u00b2)"
+        },
+        {
+          "feature": "parking_lots",
+          "value": "1"
+        },
+        {
+          "feature": "air_conditioning",
+          "value": "Yes"
+        },
+        {
+          "feature": "balcony",
+          "value": "Yes"
+        },
+        {
+          "feature": "dining_room",
+          "value": "Yes"
+        },
+        {
+          "feature": "garage",
+          "value": "Yes"
+        },
+        {
+          "feature": "internet",
+          "value": "Yes"
+        },
+        {
+          "feature": "swimming_pool",
+          "value": "Yes"
+        },
+        {
+          "feature": "washing_machine",
+          "value": "Yes"
+        },
+        {
+          "feature": "heating",
+          "value": "Gas"
+        },
+        {
+          "feature": "condition",
+          "value": "New"
+        }
+      ],
+      "files": [
+        "https://res.listglobally.com/accounts/6362754/9e319471054ac6ef577d15fe683d0518?width=220&height=92&mode=max&autorotate=true"
+      ],
+      "contact": {
+        "phone_number": "+52 984 1577534",
+        "first_name": "",
+        "last_name": "",
+        "email": "",
+        "company": "Real Estate Puerto Aventuras"
+      }
+    },
+    "progress": 100.0,
+    "status": "Completed"
+  },
+  "timestamp": "2025-04-15T21:07:17Z"
+}
